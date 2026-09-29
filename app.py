@@ -574,4 +574,8 @@ git add .
 
 git add app.py
 
+
+
 st.sidebar.title("Options")
+st.sidebar.write("Choose model or parameters here")
+
