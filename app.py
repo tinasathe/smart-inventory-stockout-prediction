@@ -568,3 +568,5 @@ elif page == "🤖 Model Performance":
 
 st.sidebar.divider()
 st.sidebar.caption("Smart Inventory Stockout & Restock Prediction")
+ git add .
+
