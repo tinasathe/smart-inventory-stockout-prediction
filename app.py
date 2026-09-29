@@ -29,7 +29,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-
 # =========================================================
 # CUSTOM CSS
 # =========================================================
@@ -38,33 +37,62 @@ st.markdown(
     """
     <style>
 
-    .main-title {
-        font-size: 42px;
-        font-weight: 700;
-        color: #1f4e79;
+    .main {
+        background-color: #f7f9fc;
     }
 
-    .sub-title {
-        font-size: 20px;
-        color: #555;
+    .block-container {
+        padding-top: 2rem;
+        padding-bottom: 2rem;
+    }
+
+    .hero {
+        padding: 30px;
+        border-radius: 18px;
+        background: linear-gradient(
+            135deg,
+            #0f172a,
+            #1d4ed8
+        );
+        color: white;
+        margin-bottom: 25px;
+    }
+
+    .hero h1 {
+        color: white;
+        font-size: 42px;
+        margin-bottom: 10px;
+    }
+
+    .hero p {
+        color: #dbeafe;
+        font-size: 18px;
     }
 
     .risk-high {
-        background-color: #ffdddd;
-        padding: 15px;
-        border-radius: 10px;
-        color: #b30000;
+        background-color: #fee2e2;
+        color: #991b1b;
+        padding: 18px;
+        border-radius: 12px;
+        font-size: 20px;
         font-weight: bold;
         text-align: center;
     }
 
     .risk-low {
-        background-color: #ddffdd;
-        padding: 15px;
-        border-radius: 10px;
-        color: #087f23;
+        background-color: #dcfce7;
+        color: #166534;
+        padding: 18px;
+        border-radius: 12px;
+        font-size: 20px;
         font-weight: bold;
         text-align: center;
+    }
+
+    .section-title {
+        font-size: 25px;
+        font-weight: 700;
+        margin-top: 20px;
     }
 
     </style>
@@ -72,97 +100,176 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-
 # =========================================================
-# DATA PATH
-# =========================================================
-
-DATA_PATH = "data/sales_data.csv"
-
-
-# =========================================================
-# LOAD DATA
+# DATA LOADING
 # =========================================================
 
 @st.cache_data
 def load_data():
 
-    df = pd.read_csv(DATA_PATH)
+    possible_paths = [
+        "data/sales_data.csv",
+        "sales_data.csv"
+    ]
 
-    # Date conversion
+    df = None
+
+    for path in possible_paths:
+        try:
+            df = pd.read_csv(path)
+            break
+        except FileNotFoundError:
+            continue
+
+    if df is None:
+        raise FileNotFoundError(
+            "sales_data.csv not found. "
+            "Place it inside data/ folder or project root."
+        )
+
+    # -----------------------------------------------------
+    # DATE
+    # -----------------------------------------------------
+
     df["Date"] = pd.to_datetime(
         df["Date"],
         errors="coerce"
     )
 
-    # Date features
+    df = df.dropna(
+        subset=["Date"]
+    )
+
+    # -----------------------------------------------------
+    # SORT DATA
+    # -----------------------------------------------------
+
+    df = df.sort_values(
+        ["Store ID", "Product ID", "Date"]
+    ).reset_index(drop=True)
+
+    # -----------------------------------------------------
+    # DATE FEATURES
+    # -----------------------------------------------------
+
     df["Year"] = df["Date"].dt.year
     df["Month"] = df["Date"].dt.month
     df["Day"] = df["Date"].dt.day
     df["DayOfWeek"] = df["Date"].dt.dayofweek
+    df["WeekOfYear"] = df["Date"].dt.isocalendar().week.astype(int)
 
-    # Inventory ratio
-    df["Inventory_Ratio"] = (
-        df["Inventory Level"] /
-        (df["Units Sold"] + 1)
+    # -----------------------------------------------------
+    # FUTURE DEMAND
+    # -----------------------------------------------------
+
+    # Approximate next 7 observations' demand
+    # for the same Store + Product.
+    #
+    # This is used only to create the historical
+    # stockout-risk target.
+
+    grouped = df.groupby(
+        ["Store ID", "Product ID"]
+    )["Units Sold"]
+
+    future_columns = []
+
+    for i in range(1, 8):
+
+        shifted = grouped.shift(-i)
+
+        future_columns.append(
+            shifted.fillna(0)
+        )
+
+    df["Future_7_Day_Demand"] = sum(
+        future_columns
     )
 
     # -----------------------------------------------------
-    # Stockout / Risk target
+    # STOCKOUT TARGET
     # -----------------------------------------------------
 
     df["Stockout"] = (
-        df["Inventory Level"] <
-        (1.5 * df["Units Sold"])
+        df["Inventory Level"]
+        < df["Future_7_Day_Demand"]
     ).astype(int)
 
-    return df
+    # -----------------------------------------------------
+    # REMOVE LAST RECORDS WITHOUT FUTURE DEMAND
+    # -----------------------------------------------------
+
+    # Last observations of each product/store do not have
+    # a complete future 7-day window.
+    valid_future = df["Future_7_Day_Demand"] > 0
+
+    model_df = df[
+        valid_future
+    ].copy()
+
+    # Fallback in case dataset structure creates no
+    # complete future records.
+    if len(model_df) < 100:
+
+        model_df = df.copy()
+
+        model_df["Stockout"] = (
+            df["Inventory Level"]
+            < (df["Units Sold"] * 1.5)
+        ).astype(int)
+
+    return df, model_df
 
 
 # =========================================================
-# TRAIN MACHINE LEARNING MODELS
+# MODEL TRAINING
 # =========================================================
 
 @st.cache_resource
-def train_models(df):
+def train_models(model_df):
 
     # =====================================================
     # CLASSIFICATION
     # =====================================================
 
     classification_features = [
+
         "Inventory Level",
         "Price",
         "Discount",
         "Promotion",
         "Competitor Pricing",
         "Epidemic",
+
         "Year",
         "Month",
         "DayOfWeek",
+        "WeekOfYear",
+
         "Category",
         "Region",
         "Weather Condition",
         "Seasonality"
     ]
 
-    X_classification = df[
+    X_classification = model_df[
         classification_features
-    ].copy()
+    ]
 
-    y_classification = df["Stockout"]
+    y_classification = model_df[
+        "Stockout"
+    ]
 
-    categorical_features = [
+    categorical_classification = [
         "Category",
         "Region",
         "Weather Condition",
         "Seasonality"
     ]
 
-    numerical_features = [
-        column
-        for column in classification_features
-        if column not in categorical_features
+    numerical_classification = [
+        c for c in classification_features
+        if c not in categorical_classification
     ]
 
     classification_preprocessor = ColumnTransformer(
@@ -170,14 +277,15 @@ def train_models(df):
             (
                 "num",
                 "passthrough",
-                numerical_features
+                numerical_classification
             ),
+
             (
                 "cat",
                 OneHotEncoder(
                     handle_unknown="ignore"
                 ),
-                categorical_features
+                categorical_classification
             )
         ]
     )
@@ -188,6 +296,7 @@ def train_models(df):
                 "preprocessor",
                 classification_preprocessor
             ),
+
             (
                 "model",
                 RandomForestClassifier(
@@ -200,7 +309,17 @@ def train_models(df):
         ]
     )
 
-    X_train_c, X_test_c, y_train_c, y_test_c = (
+    # Check if target has two classes
+
+    if y_classification.nunique() < 2:
+
+        raise ValueError(
+            "Stockout target contains only one class. "
+            "The dataset does not contain enough variation "
+            "for classification."
+        )
+
+    Xc_train, Xc_test, yc_train, yc_test = (
         train_test_split(
             X_classification,
             y_classification,
@@ -211,79 +330,98 @@ def train_models(df):
     )
 
     classifier.fit(
-        X_train_c,
-        y_train_c
+        Xc_train,
+        yc_train
     )
 
-    y_pred_c = classifier.predict(
-        X_test_c
+    yc_pred = classifier.predict(
+        Xc_test
     )
 
     classification_metrics = {
+
         "Accuracy": accuracy_score(
-            y_test_c,
-            y_pred_c
+            yc_test,
+            yc_pred
         ),
 
         "Precision": precision_score(
-            y_test_c,
-            y_pred_c,
+            yc_test,
+            yc_pred,
             zero_division=0
         ),
 
         "Recall": recall_score(
-            y_test_c,
-            y_pred_c,
+            yc_test,
+            yc_pred,
             zero_division=0
         ),
 
         "F1 Score": f1_score(
-            y_test_c,
-            y_pred_c,
+            yc_test,
+            yc_pred,
             zero_division=0
         )
     }
-
 
     # =====================================================
     # DEMAND REGRESSION
     # =====================================================
 
     regression_features = [
+
         "Inventory Level",
         "Price",
         "Discount",
         "Promotion",
         "Competitor Pricing",
         "Epidemic",
+
         "Year",
         "Month",
         "DayOfWeek",
+        "WeekOfYear",
+
         "Category",
         "Region",
         "Weather Condition",
         "Seasonality"
     ]
 
-    X_regression = df[
+    X_regression = model_df[
         regression_features
-    ].copy()
+    ]
 
-    y_regression = df["Demand"]
+    y_regression = model_df[
+        "Demand"
+    ]
+
+    categorical_regression = [
+        "Category",
+        "Region",
+        "Weather Condition",
+        "Seasonality"
+    ]
+
+    numerical_regression = [
+        c for c in regression_features
+        if c not in categorical_regression
+    ]
 
     regression_preprocessor = ColumnTransformer(
         transformers=[
             (
                 "num",
                 "passthrough",
-                numerical_features
+                numerical_regression
             ),
+
             (
                 "cat",
                 OneHotEncoder(
                     handle_unknown="ignore"
                 ),
-                categorical_features
+                categorical_regression
             )
         ]
     )
@@ -294,6 +432,7 @@ def train_models(df):
                 "preprocessor",
                 regression_preprocessor
             ),
+
             (
                 "model",
                 RandomForestRegressor(
@@ -305,7 +444,7 @@ def train_models(df):
         ]
     )
 
-    X_train_r, X_test_r, y_train_r, y_test_r = (
+    Xr_train, Xr_test, yr_train, yr_test = (
         train_test_split(
             X_regression,
             y_regression,
@@ -315,31 +454,31 @@ def train_models(df):
     )
 
     regressor.fit(
-        X_train_r,
-        y_train_r
+        Xr_train,
+        yr_train
     )
 
-    y_pred_r = regressor.predict(
-        X_test_r
+    yr_pred = regressor.predict(
+        Xr_test
     )
 
     regression_metrics = {
 
         "MAE": mean_absolute_error(
-            y_test_r,
-            y_pred_r
+            yr_test,
+            yr_pred
         ),
 
         "RMSE": np.sqrt(
             mean_squared_error(
-                y_test_r,
-                y_pred_r
+                yr_test,
+                yr_pred
             )
         ),
 
         "R2": r2_score(
-            y_test_r,
-            y_pred_r
+            yr_test,
+            yr_pred
         )
     }
 
@@ -359,41 +498,16 @@ def train_models(df):
 
 try:
 
-    df = load_data()
+    df, model_df = load_data()
 
-except Exception as error:
+except Exception as e:
 
     st.error(
         "❌ Dataset load झाला नाही."
     )
 
     st.code(
-        f"""
-Expected file:
-
-{DATA_PATH}
-
-Error:
-
-{error}
-        """
-    )
-
-    st.stop()
-
-
-# =========================================================
-# CHECK STOCKOUT TARGET
-# =========================================================
-
-if df["Stockout"].nunique() < 2:
-
-    st.error(
-        "Stockout target मध्ये दोन classes तयार झाले नाहीत."
-    )
-
-    st.info(
-        "Inventory Level आणि Units Sold च्या values check करा."
+        str(e)
     )
 
     st.stop()
@@ -412,15 +526,18 @@ try:
         regression_features,
         classification_metrics,
         regression_metrics
-    ) = train_models(df)
 
-except Exception as error:
-
-    st.error(
-        "❌ Machine Learning models train झाले नाहीत."
+    ) = train_models(
+        model_df
     )
 
-    st.exception(error)
+except Exception as e:
+
+    st.error(
+        "❌ Model training failed."
+    )
+
+    st.exception(e)
 
     st.stop()
 
@@ -429,21 +546,24 @@ except Exception as error:
 # SIDEBAR
 # =========================================================
 
-st.sidebar.title("📦 Smart Inventory AI")
-
-st.sidebar.write(
-    "Stockout & Restock Prediction System"
+st.sidebar.title(
+    "📦 Smart Inventory AI"
 )
 
-st.sidebar.divider()
+st.sidebar.caption(
+    "Stockout • Demand • Restock Prediction"
+)
 
 page = st.sidebar.radio(
+
     "Navigation",
+
     [
         "🏠 Home",
         "📊 Dashboard",
         "🔮 Prediction",
         "📈 Analytics",
+        "🚨 Stockout Alerts",
         "🤖 Model Performance"
     ]
 )
@@ -456,112 +576,103 @@ st.sidebar.info(
 
 
 # =========================================================
-# HOME PAGE
+# HOME
 # =========================================================
 
 if page == "🏠 Home":
 
     st.markdown(
-        '<div class="main-title">'
-        '📦 Smart Inventory Stockout & Restock Prediction'
-        '</div>',
+        """
+        <div class="hero">
+
+        <h1>📦 Smart Inventory AI</h1>
+
+        <p>
+        Stockout Prediction • Demand Forecasting •
+        Restock Recommendation
+        </p>
+
+        </div>
+        """,
         unsafe_allow_html=True
     )
 
-    st.markdown(
-        '<div class="sub-title">'
-        'AI-based Inventory Management System'
-        '</div>',
-        unsafe_allow_html=True
+    st.subheader(
+        "🎯 Project Overview"
+    )
+
+    st.write(
+        """
+        Smart Inventory AI is a Machine Learning based inventory
+        decision-support system.
+
+        The system analyzes historical retail data and provides:
+
+        • Product demand prediction  
+        • Stockout risk prediction  
+        • Inventory health monitoring  
+        • Restock quantity recommendation  
+        • Store and product analytics
+        """
     )
 
     st.divider()
 
-    st.write(
-        """
-        This project uses Machine Learning to analyze retail inventory,
-        predict product demand, identify stockout risk and recommend
-        inventory replenishment quantities.
-        """
-    )
+    c1, c2, c3, c4 = st.columns(4)
 
-    # -----------------------------------------------------
-    # KPI CARDS
-    # -----------------------------------------------------
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    col1.metric(
+    c1.metric(
         "📊 Total Records",
         f"{len(df):,}"
     )
 
-    col2.metric(
-        "🏪 Stores",
-        f"{df['Store ID'].nunique():,}"
-    )
-
-    col3.metric(
+    c2.metric(
         "📦 Products",
         f"{df['Product ID'].nunique():,}"
     )
 
-    col4.metric(
-        "🗂 Categories",
+    c3.metric(
+        "🏪 Stores",
+        f"{df['Store ID'].nunique():,}"
+    )
+
+    c4.metric(
+        "🏷 Categories",
         f"{df['Category'].nunique():,}"
     )
 
     st.divider()
 
-    # -----------------------------------------------------
-    # OBJECTIVES
-    # -----------------------------------------------------
-
     st.subheader(
-        "🎯 Project Objectives"
+        "🤖 Machine Learning Algorithms"
     )
 
-    objective_col1, objective_col2 = st.columns(2)
+    a1, a2 = st.columns(2)
 
-    with objective_col1:
+    with a1:
 
-        st.markdown(
+        st.info(
             """
-            ### 📈 Demand Prediction
+            **Random Forest Classifier**
 
-            Predict expected product demand using:
+            Used for stockout-risk classification.
 
-            - Price
-            - Discount
-            - Promotion
-            - Seasonality
-            - Weather
-            - Region
-            - Competitor pricing
+            Output:
+            LOW / HIGH stockout risk
             """
         )
 
-    with objective_col2:
+    with a2:
 
-        st.markdown(
+        st.info(
             """
-            ### 📦 Inventory Management
+            **Random Forest Regressor**
 
-            System provides:
+            Used for demand prediction.
 
-            - Stockout risk
-            - Demand forecast
-            - Recommended restock quantity
-            - Inventory analytics
+            Output:
+            Predicted demand in units
             """
         )
-
-    st.divider()
-
-    st.info(
-        "Stockout risk target is created from historical inventory "
-        "coverage using Inventory Level < 1.5 × Units Sold."
-    )
 
 
 # =========================================================
@@ -575,29 +686,114 @@ elif page == "📊 Dashboard":
     )
 
     # -----------------------------------------------------
-    # KPI
+    # FILTERS
     # -----------------------------------------------------
 
-    col1, col2, col3, col4 = st.columns(4)
+    f1, f2, f3 = st.columns(3)
 
-    col1.metric(
-        "Total Units Sold",
-        f"{df['Units Sold'].sum():,.0f}"
+    with f1:
+
+        selected_region = st.selectbox(
+            "🌍 Region",
+            ["All"] +
+            sorted(
+                df["Region"]
+                .dropna()
+                .unique()
+                .tolist()
+            )
+        )
+
+    with f2:
+
+        selected_category = st.selectbox(
+            "🏷 Category",
+            ["All"] +
+            sorted(
+                df["Category"]
+                .dropna()
+                .unique()
+                .tolist()
+            )
+        )
+
+    with f3:
+
+        selected_store = st.selectbox(
+            "🏪 Store",
+            ["All"] +
+            sorted(
+                df["Store ID"]
+                .dropna()
+                .unique()
+                .tolist()
+            )
+        )
+
+    dashboard_df = df.copy()
+
+    if selected_region != "All":
+
+        dashboard_df = dashboard_df[
+            dashboard_df["Region"]
+            == selected_region
+        ]
+
+    if selected_category != "All":
+
+        dashboard_df = dashboard_df[
+            dashboard_df["Category"]
+            == selected_category
+        ]
+
+    if selected_store != "All":
+
+        dashboard_df = dashboard_df[
+            dashboard_df["Store ID"]
+            == selected_store
+        ]
+
+    # -----------------------------------------------------
+    # KPI CARDS
+    # -----------------------------------------------------
+
+    total_sales = dashboard_df[
+        "Units Sold"
+    ].sum()
+
+    avg_inventory = dashboard_df[
+        "Inventory Level"
+    ].mean()
+
+    avg_demand = dashboard_df[
+        "Demand"
+    ].mean()
+
+    low_stock_count = (
+        dashboard_df["Inventory Level"]
+        < dashboard_df["Units Sold"]
+    ).sum()
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric(
+        "📈 Total Units Sold",
+        f"{total_sales:,.0f}"
     )
 
-    col2.metric(
-        "Average Inventory",
-        f"{df['Inventory Level'].mean():,.1f}"
+    c2.metric(
+        "📦 Avg Inventory",
+        f"{avg_inventory:,.1f}"
     )
 
-    col3.metric(
-        "Average Demand",
-        f"{df['Demand'].mean():,.1f}"
+    c3.metric(
+        "🎯 Avg Demand",
+        f"{avg_demand:,.1f}"
     )
 
-    col4.metric(
-        "Stockout Risk Records",
-        f"{df['Stockout'].sum():,}"
+    c4.metric(
+        "🚨 Low Stock Records",
+        f"{low_stock_count:,}"
     )
 
     st.divider()
@@ -611,41 +807,13 @@ elif page == "📊 Dashboard":
     )
 
     daily_sales = (
-        df.groupby("Date")["Units Sold"]
+        dashboard_df
+        .groupby("Date")["Units Sold"]
         .sum()
     )
 
-    fig, ax = plt.subplots(
-        figsize=(12, 4)
-    )
-
-    ax.plot(
-        daily_sales.index,
-        daily_sales.values,
-        color="#1f77b4"
-    )
-
-    ax.set_xlabel(
-        "Date"
-    )
-
-    ax.set_ylabel(
-        "Units Sold"
-    )
-
-    ax.set_title(
-        "Daily Sales Trend"
-    )
-
-    ax.grid(
-        alpha=0.2
-    )
-
-    fig.autofmt_xdate()
-
-    st.pyplot(
-        fig,
-        clear_figure=True
+    st.line_chart(
+        daily_sales
     )
 
     # -----------------------------------------------------
@@ -653,11 +821,12 @@ elif page == "📊 Dashboard":
     # -----------------------------------------------------
 
     st.subheader(
-        "🗂 Category-wise Sales"
+        "🏷 Category-wise Sales"
     )
 
     category_sales = (
-        df.groupby("Category")["Units Sold"]
+        dashboard_df
+        .groupby("Category")["Units Sold"]
         .sum()
         .sort_values(
             ascending=False
@@ -669,28 +838,25 @@ elif page == "📊 Dashboard":
     )
 
     # -----------------------------------------------------
-    # REGION SALES
+    # DOWNLOAD
     # -----------------------------------------------------
 
-    st.subheader(
-        "🌍 Region-wise Sales"
-    )
+    st.download_button(
 
-    region_sales = (
-        df.groupby("Region")["Units Sold"]
-        .sum()
-        .sort_values(
-            ascending=False
-        )
-    )
+        "📥 Download Filtered Inventory Data",
 
-    st.bar_chart(
-        region_sales
+        dashboard_df.to_csv(
+            index=False
+        ).encode("utf-8"),
+
+        file_name="filtered_inventory.csv",
+
+        mime="text/csv"
     )
 
 
 # =========================================================
-# PREDICTION PAGE
+# PREDICTION
 # =========================================================
 
 elif page == "🔮 Prediction":
@@ -700,301 +866,454 @@ elif page == "🔮 Prediction":
     )
 
     st.write(
-        "Enter product and inventory conditions to generate an AI prediction."
+        "Select a product and store to generate an AI prediction."
     )
 
     st.divider()
 
     # -----------------------------------------------------
-    # INPUTS
+    # PRODUCT + STORE
     # -----------------------------------------------------
 
-    col1, col2, col3 = st.columns(3)
+    c1, c2 = st.columns(2)
 
-    with col1:
+    with c1:
 
-        category = st.selectbox(
-            "Category",
+        selected_product = st.selectbox(
+            "📦 Select Product",
             sorted(
-                df["Category"]
+                df["Product ID"]
                 .dropna()
                 .unique()
             )
         )
 
-        region = st.selectbox(
-            "Region",
+    with c2:
+
+        selected_store = st.selectbox(
+            "🏪 Select Store",
             sorted(
-                df["Region"]
+                df["Store ID"]
                 .dropna()
                 .unique()
             )
         )
 
-        weather = st.selectbox(
-            "Weather Condition",
-            sorted(
-                df["Weather Condition"]
-                .dropna()
-                .unique()
-            )
+    selected_data = df[
+        (
+            df["Product ID"]
+            == selected_product
+        )
+        &
+        (
+            df["Store ID"]
+            == selected_store
+        )
+    ]
+
+    if len(selected_data) == 0:
+
+        st.warning(
+            "No data available for this Product + Store combination."
         )
 
-    with col2:
+    else:
 
-        seasonality = st.selectbox(
-            "Seasonality",
-            sorted(
-                df["Seasonality"]
-                .dropna()
-                .unique()
-            )
-        )
-
-        inventory = st.number_input(
-            "Current Inventory",
-            min_value=0.0,
-            value=float(
-                df["Inventory Level"].median()
-            ),
-            step=1.0
-        )
-
-        price = st.number_input(
-            "Price",
-            min_value=0.0,
-            value=float(
-                df["Price"].median()
-            ),
-            step=0.01
-        )
-
-    with col3:
-
-        discount = st.number_input(
-            "Discount",
-            min_value=0.0,
-            value=float(
-                df["Discount"].median()
-            ),
-            step=1.0
-        )
-
-        promotion = st.selectbox(
-            "Promotion",
-            sorted(
-                df["Promotion"]
-                .dropna()
-                .unique()
-            )
-        )
-
-        competitor_price = st.number_input(
-            "Competitor Pricing",
-            min_value=0.0,
-            value=float(
-                df["Competitor Pricing"].median()
-            ),
-            step=0.01
-        )
-
-    epidemic = st.selectbox(
-        "Epidemic",
-        sorted(
-            df["Epidemic"]
-            .dropna()
-            .unique()
-        )
-    )
-
-    st.divider()
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-
-        lead_time = st.number_input(
-            "Supplier Lead Time (days)",
-            min_value=1,
-            max_value=60,
-            value=7,
-            step=1
-        )
-
-    with col2:
-
-        safety_stock = st.number_input(
-            "Safety Stock",
-            min_value=0.0,
-            value=20.0,
-            step=1.0
-        )
-
-    st.divider()
-
-    # -----------------------------------------------------
-    # PREDICT BUTTON
-    # -----------------------------------------------------
-
-    if st.button(
-        "🚀 Generate Prediction",
-        use_container_width=True
-    ):
-
-        current_date = pd.Timestamp.now()
-
-        input_data = pd.DataFrame(
-            [{
-                "Inventory Level": inventory,
-                "Price": price,
-                "Discount": discount,
-                "Promotion": promotion,
-                "Competitor Pricing": competitor_price,
-                "Epidemic": epidemic,
-                "Year": current_date.year,
-                "Month": current_date.month,
-                "DayOfWeek": current_date.dayofweek,
-                "Category": category,
-                "Region": region,
-                "Weather Condition": weather,
-                "Seasonality": seasonality
-            }]
+        product_data = (
+            selected_data
+            .sort_values("Date")
+            .iloc[-1]
         )
 
         # -------------------------------------------------
-        # DEMAND PREDICTION
-        # -------------------------------------------------
-
-        predicted_demand = float(
-            regressor.predict(
-                input_data[
-                    regression_features
-                ]
-            )[0]
-        )
-
-        predicted_demand = max(
-            0,
-            predicted_demand
-        )
-
-        # -------------------------------------------------
-        # STOCKOUT PREDICTION
-        # -------------------------------------------------
-
-        stockout_class = int(
-            classifier.predict(
-                input_data[
-                    classification_features
-                ]
-            )[0]
-        )
-
-        # Probability
-        probability = float(
-            classifier.predict_proba(
-                input_data[
-                    classification_features
-                ]
-            )[0][1]
-        )
-
-        # -------------------------------------------------
-        # RESTOCK CALCULATION
-        # -------------------------------------------------
-
-        target_stock = (
-            predicted_demand
-            * lead_time
-            + safety_stock
-        )
-
-        recommended_restock = max(
-            0,
-            target_stock - inventory
-        )
-
-        # -------------------------------------------------
-        # RESULTS
+        # CURRENT INFORMATION
         # -------------------------------------------------
 
         st.subheader(
-            "📊 Prediction Results"
+            "📋 Current Inventory Information"
         )
 
-        result1, result2, result3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
 
-        result1.metric(
-            "📈 Predicted Demand",
-            f"{predicted_demand:.0f} units"
+        c1.metric(
+            "📦 Current Inventory",
+            f"{product_data['Inventory Level']:.0f}"
         )
 
-        result2.metric(
-            "⚠️ Stockout Probability",
-            f"{probability * 100:.1f}%"
+        c2.metric(
+            "📈 Last Units Sold",
+            f"{product_data['Units Sold']:.0f}"
         )
 
-        result3.metric(
-            "📦 Recommended Restock",
-            f"{recommended_restock:.0f} units"
+        c3.metric(
+            "💰 Price",
+            f"₹{product_data['Price']:.2f}"
+        )
+
+        c4.metric(
+            "🏷 Category",
+            str(product_data["Category"])
         )
 
         st.divider()
 
         # -------------------------------------------------
-        # RISK DISPLAY
+        # SETTINGS
         # -------------------------------------------------
 
-        if stockout_class == 1:
+        st.subheader(
+            "⚙️ Prediction Settings"
+        )
 
-            st.markdown(
-                """
-                <div class="risk-high">
-                ⚠️ HIGH STOCKOUT RISK
-                </div>
-                """,
-                unsafe_allow_html=True
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+
+            lead_time = st.number_input(
+                "🚚 Supplier Lead Time (days)",
+                min_value=1,
+                max_value=60,
+                value=7
             )
 
-        else:
+        with c2:
 
-            st.markdown(
-                """
-                <div class="risk-low">
-                ✅ LOW STOCKOUT RISK
-                </div>
-                """,
-                unsafe_allow_html=True
+            safety_stock = st.number_input(
+                "🛡 Safety Stock",
+                min_value=0.0,
+                value=20.0,
+                step=1.0
             )
 
-        st.progress(
-            min(
-                max(
-                    probability,
-                    0.0
+        with c3:
+
+            planning_days = st.number_input(
+                "📅 Planning Horizon (days)",
+                min_value=1,
+                max_value=30,
+                value=7
+            )
+
+        st.divider()
+
+        # -------------------------------------------------
+        # PREDICT
+        # -------------------------------------------------
+
+        if st.button(
+            "🚀 Generate AI Prediction",
+            use_container_width=True
+        ):
+
+            input_data = pd.DataFrame(
+                [{
+                    "Inventory Level":
+                        product_data[
+                            "Inventory Level"
+                        ],
+
+                    "Price":
+                        product_data["Price"],
+
+                    "Discount":
+                        product_data["Discount"],
+
+                    "Promotion":
+                        product_data["Promotion"],
+
+                    "Competitor Pricing":
+                        product_data[
+                            "Competitor Pricing"
+                        ],
+
+                    "Epidemic":
+                        product_data["Epidemic"],
+
+                    "Year":
+                        product_data["Year"],
+
+                    "Month":
+                        product_data["Month"],
+
+                    "DayOfWeek":
+                        product_data[
+                            "DayOfWeek"
+                        ],
+
+                    "WeekOfYear":
+                        product_data[
+                            "WeekOfYear"
+                        ],
+
+                    "Category":
+                        product_data["Category"],
+
+                    "Region":
+                        product_data["Region"],
+
+                    "Weather Condition":
+                        product_data[
+                            "Weather Condition"
+                        ],
+
+                    "Seasonality":
+                        product_data[
+                            "Seasonality"
+                        ]
+                }]
+            )
+
+            # ---------------------------------------------
+            # DEMAND
+            # ---------------------------------------------
+
+            predicted_daily_demand = float(
+                regressor.predict(
+                    input_data[
+                        regression_features
+                    ]
+                )[0]
+            )
+
+            predicted_daily_demand = max(
+                0,
+                predicted_daily_demand
+            )
+
+            # ---------------------------------------------
+            # STOCKOUT
+            # ---------------------------------------------
+
+            stockout_class = int(
+                classifier.predict(
+                    input_data[
+                        classification_features
+                    ]
+                )[0]
+            )
+
+            probability = float(
+                classifier.predict_proba(
+                    input_data[
+                        classification_features
+                    ]
+                )[0][1]
+            )
+
+            # ---------------------------------------------
+            # RESTOCK
+            # ---------------------------------------------
+
+            current_inventory = float(
+                product_data[
+                    "Inventory Level"
+                ]
+            )
+
+            forecast_demand = (
+                predicted_daily_demand
+                * planning_days
+            )
+
+            lead_time_demand = (
+                predicted_daily_demand
+                * lead_time
+            )
+
+            target_stock = (
+                lead_time_demand
+                + safety_stock
+            )
+
+            recommended_restock = max(
+                0,
+                target_stock
+                - current_inventory
+            )
+
+            # ---------------------------------------------
+            # RESULTS
+            # ---------------------------------------------
+
+            st.success(
+                "✅ AI prediction generated successfully!"
+            )
+
+            st.subheader(
+                "📊 Prediction Results"
+            )
+
+            r1, r2, r3, r4 = st.columns(4)
+
+            r1.metric(
+                "📈 Daily Demand",
+                f"{predicted_daily_demand:.0f}"
+            )
+
+            r2.metric(
+                f"📅 {planning_days}-Day Demand",
+                f"{forecast_demand:.0f}"
+            )
+
+            r3.metric(
+                "🚨 Stockout Probability",
+                f"{probability * 100:.1f}%"
+            )
+
+            r4.metric(
+                "📦 Recommended Restock",
+                f"{recommended_restock:.0f}"
+            )
+
+            st.divider()
+
+            # ---------------------------------------------
+            # RISK
+            # ---------------------------------------------
+
+            if stockout_class == 1:
+
+                st.markdown(
+                    """
+                    <div class="risk-high">
+                    🚨 HIGH STOCKOUT RISK
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
+            else:
+
+                st.markdown(
+                    """
+                    <div class="risk-low">
+                    ✅ LOW STOCKOUT RISK
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
+            st.progress(
+                min(
+                    max(
+                        probability,
+                        0.0
+                    ),
+                    1.0
+                )
+            )
+
+            st.write(
+                f"Estimated stockout probability: "
+                f"**{probability * 100:.2f}%**"
+            )
+
+            # ---------------------------------------------
+            # RESTOCK EXPLANATION
+            # ---------------------------------------------
+
+            st.subheader(
+                "📦 Restock Recommendation"
+            )
+
+            st.info(
+                f"""
+**Current Inventory:** {current_inventory:.0f} units
+
+**Predicted Daily Demand:** {predicted_daily_demand:.0f} units
+
+**Supplier Lead Time:** {lead_time} days
+
+**Lead Time Demand:** {lead_time_demand:.0f} units
+
+**Safety Stock:** {safety_stock:.0f} units
+
+**Target Stock:** {target_stock:.0f} units
+
+### Recommended Restock: {recommended_restock:.0f} units
+"""
+            )
+
+            # ---------------------------------------------
+            # PRODUCT HISTORY
+            # ---------------------------------------------
+
+            with st.expander(
+                "🔎 View Product History"
+            ):
+
+                history = (
+                    selected_data
+                    .sort_values(
+                        "Date",
+                        ascending=False
+                    )
+                    .head(30)
+                )
+
+                st.dataframe(
+                    history,
+                    use_container_width=True
+                )
+
+            # ---------------------------------------------
+            # DOWNLOAD PREDICTION
+            # ---------------------------------------------
+
+            result_df = pd.DataFrame(
+                [{
+                    "Product ID":
+                        selected_product,
+
+                    "Store ID":
+                        selected_store,
+
+                    "Current Inventory":
+                        current_inventory,
+
+                    "Predicted Daily Demand":
+                        predicted_daily_demand,
+
+                    "Planning Horizon":
+                        planning_days,
+
+                    "Predicted Horizon Demand":
+                        forecast_demand,
+
+                    "Stockout Probability":
+                        probability,
+
+                    "Stockout Risk":
+                        "HIGH"
+                        if stockout_class == 1
+                        else "LOW",
+
+                    "Lead Time":
+                        lead_time,
+
+                    "Safety Stock":
+                        safety_stock,
+
+                    "Recommended Restock":
+                        recommended_restock
+                }]
+            )
+
+            st.download_button(
+
+                "📥 Download Prediction Report",
+
+                result_df.to_csv(
+                    index=False
+                ).encode("utf-8"),
+
+                file_name=(
+                    f"{selected_product}_"
+                    f"{selected_store}_prediction.csv"
                 ),
-                1.0
+
+                mime="text/csv"
             )
-        )
-
-        st.write(
-            f"Estimated stockout probability: "
-            f"**{probability * 100:.2f}%**"
-        )
-
-        st.info(
-            f"""
-            Recommended Target Stock:
-
-            Predicted Demand × Lead Time + Safety Stock
-
-            = {predicted_demand:.1f}
-            × {lead_time}
-            + {safety_stock:.1f}
-
-            = {target_stock:.1f} units
-            """
-        )
 
 
 # =========================================================
@@ -1033,7 +1352,7 @@ elif page == "📈 Analytics":
         sample_df["Inventory Level"],
         sample_df["Units Sold"],
         alpha=0.35,
-        color="#ff7f0e"
+        color="#2563eb"
     )
 
     ax.set_xlabel(
@@ -1082,13 +1401,11 @@ elif page == "📈 Analytics":
         .str.zfill(2)
     )
 
-    monthly_chart = (
-        monthly_sales
-        .set_index("Period")["Units Sold"]
-    )
-
     st.line_chart(
-        monthly_chart
+        monthly_sales
+        .set_index("Period")[
+            "Units Sold"
+        ]
     )
 
     # -----------------------------------------------------
@@ -1100,7 +1417,9 @@ elif page == "📈 Analytics":
     )
 
     region_demand = (
-        df.groupby("Region")["Demand"]
+        df.groupby(
+            "Region"
+        )["Demand"]
         .mean()
         .sort_values(
             ascending=False
@@ -1120,7 +1439,9 @@ elif page == "📈 Analytics":
     )
 
     season_demand = (
-        df.groupby("Seasonality")["Demand"]
+        df.groupby(
+            "Seasonality"
+        )["Demand"]
         .mean()
         .sort_values(
             ascending=False
@@ -1129,6 +1450,140 @@ elif page == "📈 Analytics":
 
     st.bar_chart(
         season_demand
+    )
+
+    # -----------------------------------------------------
+    # CATEGORY DEMAND
+    # -----------------------------------------------------
+
+    st.subheader(
+        "🏷 Category-wise Average Demand"
+    )
+
+    category_demand = (
+        df.groupby(
+            "Category"
+        )["Demand"]
+        .mean()
+        .sort_values(
+            ascending=False
+        )
+    )
+
+    st.bar_chart(
+        category_demand
+    )
+
+
+# =========================================================
+# STOCKOUT ALERTS
+# =========================================================
+
+elif page == "🚨 Stockout Alerts":
+
+    st.title(
+        "🚨 Stockout Risk & Low Inventory Alerts"
+    )
+
+    st.write(
+        """
+        This page identifies products that may require
+        inventory attention.
+        """
+    )
+
+    alert_df = df.copy()
+
+    # Current low-stock rule
+    alert_df["Inventory_Coverage"] = (
+        alert_df["Inventory Level"]
+        / (alert_df["Units Sold"] + 1)
+    )
+
+    alert_df["Alert"] = np.where(
+        alert_df["Inventory Level"]
+        <= alert_df["Units Sold"],
+        "HIGH",
+        np.where(
+            alert_df["Inventory_Coverage"] < 2,
+            "MEDIUM",
+            "LOW"
+        )
+    )
+
+    high_alerts = alert_df[
+        alert_df["Alert"] == "HIGH"
+    ]
+
+    medium_alerts = alert_df[
+        alert_df["Alert"] == "MEDIUM"
+    ]
+
+    c1, c2, c3 = st.columns(3)
+
+    c1.metric(
+        "🚨 HIGH",
+        f"{len(high_alerts):,}"
+    )
+
+    c2.metric(
+        "⚠️ MEDIUM",
+        f"{len(medium_alerts):,}"
+    )
+
+    c3.metric(
+        "🟢 LOW",
+        f"{len(alert_df[alert_df['Alert'] == 'LOW']):,}"
+    )
+
+    st.divider()
+
+    st.subheader(
+        "🚨 Products Requiring Attention"
+    )
+
+    display_alerts = (
+        alert_df[
+            alert_df["Alert"].isin(
+                ["HIGH", "MEDIUM"]
+            )
+        ]
+        .sort_values(
+            "Inventory_Coverage"
+        )
+        [
+            [
+                "Date",
+                "Store ID",
+                "Product ID",
+                "Category",
+                "Region",
+                "Inventory Level",
+                "Units Sold",
+                "Demand",
+                "Inventory_Coverage",
+                "Alert"
+            ]
+        ]
+        .head(100)
+    )
+
+    st.dataframe(
+        display_alerts,
+        use_container_width=True
+    )
+
+    st.download_button(
+
+        "📥 Download Alert Report",
+
+        display_alerts.to_csv(
+            index=False
+        ).encode("utf-8"),
+
+        file_name="stockout_alert_report.csv",
+
+        mime="text/csv"
     )
 
 
@@ -1147,7 +1602,7 @@ elif page == "🤖 Model Performance":
     # -----------------------------------------------------
 
     st.subheader(
-        "⚠️ Stockout Classification"
+        "🚨 Stockout Classification"
     )
 
     st.caption(
@@ -1217,25 +1672,56 @@ elif page == "🤖 Model Performance":
         "📊 Dataset Information"
     )
 
-    info1, info2, info3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
 
-    info1.metric(
+    c1.metric(
         "Rows",
         f"{len(df):,}"
     )
 
-    info2.metric(
+    c2.metric(
         "Columns",
         f"{len(df.columns):,}"
     )
 
-    info3.metric(
+    c3.metric(
         "Missing Values",
         f"{df.isnull().sum().sum():,}"
     )
 
+    c4.metric(
+        "Duplicate Rows",
+        f"{df.duplicated().sum():,}"
+    )
+
+    st.divider()
+
+    # -----------------------------------------------------
+    # TARGET DISTRIBUTION
+    # -----------------------------------------------------
+
+    st.subheader(
+        "🚨 Stockout Target Distribution"
+    )
+
+    stockout_counts = (
+        model_df["Stockout"]
+        .value_counts()
+        .rename(
+            {
+                0: "No Stockout Risk",
+                1: "Stockout Risk"
+            }
+        )
+    )
+
+    st.bar_chart(
+        stockout_counts
+    )
+
     st.success(
-        "Models are automatically trained when the application starts."
+        "Machine Learning models are trained automatically "
+        "when the application starts."
     )
 
 
@@ -1250,5 +1736,5 @@ st.sidebar.caption(
 )
 
 st.sidebar.caption(
-    "Machine Learning • Streamlit • Python"
+    "Python • Pandas • Scikit-learn • Streamlit"
 )
