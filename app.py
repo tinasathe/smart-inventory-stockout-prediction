@@ -570,3 +570,8 @@ st.sidebar.divider()
 st.sidebar.caption("Smart Inventory Stockout & Restock Prediction")
  git add .
 
+git add .
+
+git add app.py
+
+st.sidebar.title("Options")
